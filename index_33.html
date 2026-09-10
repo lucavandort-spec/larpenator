@@ -1078,6 +1078,21 @@
     background: none; border: 0; color: var(--ink-faint); font-size: 1.2rem;
     line-height: 1; padding: 2px 4px; cursor: pointer;
   }
+
+  /* ── Sync ── */
+  .sync-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-left:9px;
+    vertical-align:middle; background:var(--ink-faint); cursor:pointer; }
+  .sync-dot[data-state="ok"] { background:#34d399; box-shadow:0 0 8px rgba(52,211,153,.6); }
+  .sync-dot[data-state="syncing"] { background:#5b9bff; animation:syncPulse 1s ease-in-out infinite; }
+  .sync-dot[data-state="offline"] { background:#f5b544; }
+  .sync-dot[data-state="error"], .sync-dot[data-state="badkey"] { background:#f4566e; }
+  @keyframes syncPulse { 50% { opacity:.3; } }
+  .sync-status { font-family:var(--font-mono); font-size:var(--fs-small); color:var(--ink-dim); margin:10px 0 14px; }
+  .sync-status.bad { color:#f4566e; }
+  #sync-token { flex:1; min-width:0; max-width:440px; background:var(--input-bg); border:1px solid var(--border);
+    border-radius:var(--r-sm); padding:10px 12px; font-family:var(--font-mono); color:var(--ink); }
+  #sync-actions { margin-top:10px; }
+  @media (max-width:860px) { #sync-token { font-size:16px; } }
 </style>
 </head>
 <body>
@@ -1091,7 +1106,7 @@
   <nav class="sidebar">
     <div class="brand">
       <div>
-        <div class="brand-name">The Larpenator 3000</div>
+        <div class="brand-name">The Larpenator 3000<span class="sync-dot" id="sync-dot" hidden></span></div>
         <div class="brand-sub">Trading Journal</div>
       </div>
     </div>
@@ -1695,6 +1710,19 @@
         <div id="storage-meter"></div>
       </div>
 
+      <div class="data-card" id="sync-card" style="display:block;">
+        <div class="dtxt"><b>Sync between devices</b> — keeps this app identical on your Mac and iPhone through your private GitHub repo. Add or edit on either one.</div>
+        <div class="sync-status" id="sync-status">Not set up on this device yet.</div>
+        <div class="inline-controls" id="sync-setup">
+          <input type="password" id="sync-token" placeholder="Paste your sync key" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <button class="btn small cyan" id="sync-connect">Connect</button>
+        </div>
+        <div class="inline-controls" id="sync-actions" hidden>
+          <button class="btn small cyan" id="sync-now">Sync now</button>
+          <button class="btn small ghost" id="sync-disconnect">Disconnect</button>
+        </div>
+      </div>
+
       <div class="data-card" id="install-card" style="display:none;">
         <div class="dtxt"><b>Install as an app</b> — runs in its own window, no browser chrome, works offline.</div>
         <button class="btn small cyan" id="install-btn">Install</button>
@@ -1747,6 +1775,473 @@
 
 <script>
 (function () {
+
+  // ══════════ Sync between devices + image store ══════════
+  // Images live in IndexedDB (Safari caps localStorage near 5 MB); stored data
+  // holds "img:<hash>" references instead. Everything listed in KIND syncs
+  // through a private GitHub repo, merged item by item using per-item edit
+  // times and deletion tombstones, so edits on either device survive.
+  // 'value' keys travel as the exact stored text (some are plain text, not
+  // JSON) and are replaced whole; 'list'/'map' keys are JSON merged per item.
+  const SYNC = (() => {
+    const REPO = 'lucavandort-spec/larpenator-data';
+    const TOKEN_KEY = 'lvd_sync_token', STATE_KEY = 'lvd_sync_state';
+    const KIND = {
+      lvd_journal_entries: 'list', lvd_achievements: 'list', lvd_premarket_scenarios: 'list',
+      lvd_goals: 'list', lvd_daily_bias: 'list',
+      lvd_weekly_reviews: 'map', 'larp_pnl_v1:manual_trading': 'map',
+      lvd_focus_rule: 'value', lvd_milestone: 'value', lvd_mistake_tags: 'value',
+      lvd_trade_checklist: 'value', lvd_algo_pnl: 'value', lvd_possize: 'value', lvd_rulebook: 'value'
+    };
+    const KEYS = Object.keys(KIND), KEYSET = new Set(KEYS);
+    const DEVICE = /iPhone|iPad|iPod/.test(navigator.userAgent) ? 'iPhone'
+      : /Mac/.test(navigator.userAgent) ? 'Mac' : 'browser';
+    const ls = window.localStorage;
+    const origSet = Storage.prototype.setItem;
+    const setRaw = (k, v) => origSet.call(ls, k, v);
+
+    // ---- images ----
+    const IMG = new Map(), persisted = new Set(), HASH_OF = new Map();
+    function h53(str, seed) {
+      let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+      for (let i = 0; i < str.length; i++) {
+        const ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761); h2 = Math.imul(h2 ^ ch, 1597334677);
+      }
+      h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+      h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+      return (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+    }
+    function imgHash(s) {
+      let h = HASH_OF.get(s);
+      if (!h) { h = h53(s, 1) + h53(s, 2); HASH_OF.set(s, h); }
+      return h;
+    }
+    const isData = (v) => typeof v === 'string' && v.startsWith('data:image/');
+    // Deep copy with every inline image swapped for its reference.
+    function normalize(v, fresh) {
+      if (isData(v)) {
+        const h = imgHash(v);
+        if (!IMG.has(h)) IMG.set(h, v);
+        if (!persisted.has(h)) fresh.add(h);
+        return 'img:' + h;
+      }
+      if (Array.isArray(v)) return v.map(x => normalize(x, fresh));
+      if (v && typeof v === 'object') { const o = {}; for (const k in v) o[k] = normalize(v[k], fresh); return o; }
+      return v;
+    }
+    const resolve = (x) => (typeof x === 'string' && x.startsWith('img:')) ? (IMG.get(x.slice(4)) || x) : x;
+    function refsIn(v, out) {
+      if (typeof v === 'string') { if (v.startsWith('img:')) out.add(v.slice(4)); }
+      else if (Array.isArray(v)) v.forEach(x => refsIn(x, out));
+      else if (v && typeof v === 'object') for (const k in v) refsIn(v[k], out);
+      return out;
+    }
+
+    let dbp = null;
+    function db() {
+      if (!dbp) dbp = new Promise(res => {
+        try {
+          const r = indexedDB.open('larpenator-images', 1);
+          r.onupgradeneeded = () => r.result.createObjectStore('img');
+          r.onsuccess = () => res(r.result); r.onerror = () => res(null);
+        } catch (e) { res(null); }
+      });
+      return dbp;
+    }
+    async function idbLoadAll() {
+      const d = await db(); if (!d) return;
+      await new Promise(res => {
+        const req = d.transaction('img', 'readonly').objectStore('img').openCursor();
+        req.onsuccess = () => {
+          const c = req.result;
+          if (c) { IMG.set(c.key, c.value); persisted.add(c.key); c.continue(); } else res();
+        };
+        req.onerror = () => res();
+      });
+    }
+    async function persist(hashes) {
+      const todo = [...hashes].filter(h => !persisted.has(h) && IMG.has(h));
+      if (!todo.length) return true;
+      const d = await db(); if (!d) return false;
+      const ok = await new Promise(res => {
+        const tx = d.transaction('img', 'readwrite'), st = tx.objectStore('img');
+        todo.forEach(h => st.put(IMG.get(h), h));
+        tx.oncomplete = () => res(true); tx.onerror = tx.onabort = () => res(false);
+      });
+      if (ok) todo.forEach(h => persisted.add(h));
+      return ok;
+    }
+    // Swap a key's inline images for references, but only once they are safely
+    // in IndexedDB, so an image can never exist nowhere.
+    async function compact(k) {
+      if (KIND[k] === 'value') return;
+      const raw = ls.getItem(k);
+      if (!raw || raw.indexOf('data:image/') < 0) return;
+      const p = parse(raw); if (!p.json) return;
+      const fresh = new Set(), norm = normalize(p.v, fresh);
+      if (!(await persist(fresh))) return;
+      if (ls.getItem(k) !== raw) return compact(k);
+      try { setRaw(k, JSON.stringify(norm)); } catch (e) {}
+    }
+
+    // ---- sync state (per device, never synced) ----
+    const blank = () => ({ commit: null, t: {}, dead: {}, last: 0 });
+    let S;
+    try { S = Object.assign(blank(), JSON.parse(ls.getItem(STATE_KEY) || '{}')); } catch (e) { S = blank(); }
+    const saveState = () => { try { setRaw(STATE_KEY, JSON.stringify(S)); } catch (e) {} };
+    const token = () => ls.getItem(TOKEN_KEY);
+
+    function parse(raw) {
+      if (raw == null) return { json: true, v: undefined };
+      try { return { json: true, v: JSON.parse(raw) }; } catch (e) { return { json: false, v: raw }; }
+    }
+    function sortDeep(v) {
+      if (Array.isArray(v)) return v.map(sortDeep);
+      if (v && typeof v === 'object') { const o = {}; Object.keys(v).sort().forEach(k => { o[k] = sortDeep(v[k]); }); return o; }
+      return v;
+    }
+    const canon = (v) => v === undefined ? '~' : JSON.stringify(sortDeep(v));
+    const idOf = (x, i) => (x && typeof x === 'object' && x.id != null) ? String(x.id) : '#' + i;
+    function asMap(kind, v) {
+      const m = new Map();
+      if (kind === 'list' && Array.isArray(v)) v.forEach((x, i) => m.set(idOf(x, i), x));
+      else if (kind === 'map' && v && typeof v === 'object') Object.keys(v).forEach(k => m.set(k, v[k]));
+      return m;
+    }
+
+    // ---- record local edits: every write to a synced key is diffed ----
+    let dirty = true, editSeq = 0, applying = false, timer = null;
+    function track(k, oldV, newV) {
+      const kind = KIND[k], now = Date.now();
+      if (kind === 'value') {
+        if (canon(oldV) === canon(newV)) return;
+        S.t[k] = now;
+      } else {
+        const a = asMap(kind, oldV), b = asMap(kind, newV);
+        const t = S.t[k] = (S.t[k] && typeof S.t[k] === 'object') ? S.t[k] : {};
+        const dead = S.dead[k] = S.dead[k] || {};
+        let touched = false;
+        b.forEach((x, id) => {
+          if (!a.has(id) || canon(a.get(id)) !== canon(x)) { t[id] = now; delete dead[id]; touched = true; }
+        });
+        a.forEach((x, id) => { if (!b.has(id)) { dead[id] = now; delete t[id]; touched = true; } });
+        if (!touched) return;
+      }
+      saveState(); dirty = true; editSeq++; schedule(2500);
+    }
+    Storage.prototype.setItem = function (k, v) {
+      if (this !== ls || applying || !KEYSET.has(k)) return origSet.call(this, k, v);
+      if (KIND[k] === 'value') {
+        const old = ls.getItem(k);
+        origSet.call(this, k, String(v));
+        track(k, old, String(v));
+        return;
+      }
+      const p = parse(String(v));
+      const fresh = new Set();
+      const newN = p.json ? normalize(p.v, fresh) : p.v;
+      const old = parse(ls.getItem(k));
+      const oldN = old.json ? normalize(old.v, new Set()) : old.v;
+      // New images stay inline until IndexedDB has them; compact() swaps them after.
+      origSet.call(this, k, (!p.json || fresh.size) ? String(v) : JSON.stringify(newN));
+      track(k, oldN, newN);
+      if (fresh.size) persist(fresh).then(() => compact(k));
+    };
+
+    // ---- merge ----
+    const baseT = (x) => (x && typeof x === 'object' && typeof x.createdAt === 'number') ? x.createdAt : 1;
+    function mergeKey(kind, L, R, first) {
+      if (!R) return L;
+      if (!L) return R;
+      if (kind === 'value') {
+        const lt = typeof L.t === 'number' ? L.t : 1, rt = typeof R.t === 'number' ? R.t : 1;
+        return (first || rt >= lt) ? R : L;
+      }
+      const lm = asMap(kind, L.value), rm = asMap(kind, R.value);
+      const lt = (L.t && typeof L.t === 'object') ? L.t : {}, rt = (R.t && typeof R.t === 'object') ? R.t : {};
+      const ld = L.dead || {}, rd = R.dead || {};
+      const ids = new Set([...lm.keys(), ...rm.keys(), ...Object.keys(ld), ...Object.keys(rd)]);
+      const t = {}, dead = {}, keep = new Map();
+      ids.forEach(id => {
+        const li = lm.get(id), ri = rm.get(id);
+        const lT = li !== undefined ? (lt[id] || baseT(li)) : -1;
+        const rT = ri !== undefined ? (rt[id] || baseT(ri)) : -1;
+        // A device's first sync defers to the cloud on conflicts, so a fresh
+        // install can never overwrite existing data with its empty defaults.
+        const useR = ri !== undefined && (li === undefined || first || rT >= lT);
+        const best = useR ? ri : li, bT = useR ? rT : lT;
+        const dT = Math.max(ld[id] || -1, rd[id] || -1);
+        if (best === undefined || dT >= bT) { if (dT > 0) dead[id] = dT; }
+        else { keep.set(id, best); t[id] = bT; }
+      });
+      let value;
+      if (kind === 'map') {
+        value = {};
+        [...Object.keys(L.value || {}), ...Object.keys(R.value || {})].forEach(k => {
+          if (keep.has(k) && !(k in value)) value[k] = keep.get(k);
+        });
+      } else {
+        const items = [...keep.values()];
+        if (items.length && items.every(x => x && typeof x.createdAt === 'number')) {
+          const ref = (Array.isArray(L.value) && L.value.length > 1) ? L.value : R.value;
+          let dir = 1;
+          if (Array.isArray(ref) && ref.length > 1 && typeof ref[0].createdAt === 'number'
+              && typeof ref[ref.length - 1].createdAt === 'number') {
+            dir = ref[ref.length - 1].createdAt >= ref[0].createdAt ? 1 : -1;
+          }
+          value = items.sort((a, b) => dir * (a.createdAt - b.createdAt) || (String(a.id) < String(b.id) ? -1 : 1));
+        } else {
+          const seen = new Set(); value = [];
+          [L.value, R.value].forEach(arr => (Array.isArray(arr) ? arr : []).forEach((x, i) => {
+            const id = idOf(x, i);
+            if (keep.has(id) && !seen.has(id)) { seen.add(id); value.push(keep.get(id)); }
+          }));
+        }
+      }
+      return { t, dead, value };
+    }
+    function collectLocal() {
+      const out = {};
+      KEYS.forEach(k => {
+        const raw = ls.getItem(k); if (raw == null) return;
+        const p = parse(raw);
+        out[k] = {
+          t: S.t[k] !== undefined ? S.t[k] : (KIND[k] === 'value' ? 1 : {}),
+          dead: S.dead[k] || {},
+          value: KIND[k] === 'value' ? raw : (p.json ? normalize(p.v, new Set()) : p.v)
+        };
+      });
+      return out;
+    }
+
+    // ---- GitHub ----
+    async function gh(path, method, body, tok) {
+      const r = await fetch('https://api.github.com/repos/' + REPO + path, {
+        method: method || 'GET', cache: 'no-store',
+        headers: Object.assign({ Authorization: 'Bearer ' + (tok || token()), Accept: 'application/vnd.github+json' },
+          body ? { 'Content-Type': 'application/json' } : {}),
+        body: body ? JSON.stringify(body) : undefined
+      });
+      if (!r.ok) { const e = new Error('GitHub replied ' + r.status); e.status = r.status; throw e; }
+      return r.status === 204 ? null : r.json();
+    }
+    function b64text(b64) {
+      const bin = atob(b64.replace(/\s/g, ''));
+      return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+    }
+    async function pool(items, n, fn) {
+      let i = 0;
+      await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+        while (i < items.length) await fn(items[i++]);
+      }));
+    }
+    async function readRemote(head) {
+      const c = await gh('/git/commits/' + head);
+      const tr = await gh('/git/trees/' + c.tree.sha + '?recursive=1');
+      const files = new Map();
+      tr.tree.forEach(e => { if (e.type === 'blob') files.set(e.path, e.sha); });
+      let data = null;
+      if (files.has('data.json')) data = JSON.parse(b64text((await gh('/git/blobs/' + files.get('data.json'))).content));
+      return { tree: c.tree.sha, files, data };
+    }
+
+    let running = false, again = false, pending = false, state = 'off', lastErr = '';
+    function schedule(ms) { if (!token()) return; clearTimeout(timer); timer = setTimeout(run, ms); }
+
+    async function run() {
+      if (!token()) return;
+      if (running) { again = true; return; }
+      if (!navigator.onLine) { setStatus('offline'); return; }
+      running = true; setStatus('syncing');
+      let pushedImages = 0, changed = false;
+      try {
+        for (let attempt = 0; ; attempt++) {
+          if (attempt > 5) throw new Error('Kept colliding with the other device');
+          const seq = editSeq;
+          const head = (await gh('/git/ref/heads/main')).object.sha;
+          if (head === S.commit && !dirty) break;
+          const first = !S.commit;
+          const remote = await readRemote(head);
+          const R = (remote.data && remote.data.keys) || {};
+          const L = collectLocal(), M = {};
+          KEYS.forEach(k => { const m = mergeKey(KIND[k], L[k], R[k], first); if (m) M[k] = m; });
+
+          // Fetch any image the merged data needs that this device lacks.
+          const refs = [...refsIn(KEYS.map(k => M[k] && M[k].value), new Set())];
+          const need = refs.filter(h => !IMG.has(h) && remote.files.has('img/' + h));
+          await pool(need, 4, async h => { IMG.set(h, b64text((await gh('/git/blobs/' + remote.files.get('img/' + h))).content)); });
+          await persist(new Set(need));
+
+          // Something was saved while we were talking to GitHub: start over with it.
+          if (editSeq !== seq) continue;
+
+          applying = true;
+          try {
+            KEYS.forEach(k => {
+              if (!M[k]) return;
+              if (!L[k] || canon(L[k].value) !== canon(M[k].value)) {
+                setRaw(k, KIND[k] === 'value' ? String(M[k].value) : JSON.stringify(M[k].value));
+                changed = true;
+              }
+              S.t[k] = M[k].t; S.dead[k] = M[k].dead;
+            });
+          } finally { applying = false; }
+
+          if (canon(M) !== canon(R)) {
+            const up = refs.filter(h => !remote.files.has('img/' + h) && IMG.has(h));
+            const tree = [];
+            await pool(up, 4, async h => {
+              const b = await gh('/git/blobs', 'POST', { content: IMG.get(h), encoding: 'utf-8' });
+              tree.push({ path: 'img/' + h, mode: '100644', type: 'blob', sha: b.sha });
+            });
+            pushedImages = up.length;
+            const data = await gh('/git/blobs', 'POST', { content: JSON.stringify({ v: 2, device: DEVICE, keys: M }), encoding: 'utf-8' });
+            tree.push({ path: 'data.json', mode: '100644', type: 'blob', sha: data.sha });
+            const t = await gh('/git/trees', 'POST', { base_tree: remote.tree, tree });
+            const c = await gh('/git/commits', 'POST', { message: 'Sync from ' + DEVICE, tree: t.sha, parents: [head] });
+            try { await gh('/git/refs/heads/main', 'PATCH', { sha: c.sha, force: false }); }
+            catch (e) { if (e.status === 422) continue; throw e; }   // the other device got there first
+            S.commit = c.sha;
+          } else {
+            S.commit = head;
+          }
+          if (editSeq === seq) dirty = false; else again = true;
+          S.last = Date.now(); saveState();
+          break;
+        }
+        setStatus('ok');
+        if (pushedImages > 5) showToast('Uploaded ' + pushedImages + ' images to your sync');
+        if (changed) refreshUI();
+      } catch (e) {
+        console.error('[sync]', e);
+        lastErr = e.message || String(e);
+        setStatus(e.status === 401 || e.status === 403 ? 'badkey'
+          : (!navigator.onLine || e instanceof TypeError) ? 'offline' : 'error');
+      } finally {
+        running = false;
+        if (again) { again = false; schedule(400); }
+      }
+    }
+
+    // ---- showing incoming changes ----
+    const activeTab = () => { const n = document.querySelector('.nav-item.active[data-tab]'); return n ? n.dataset.tab : null; };
+    function reloadInto(tab) {
+      try { sessionStorage.setItem('lvd_tab', tab || activeTab() || ''); } catch (e) {}
+      location.reload();
+    }
+    function busy() {
+      const a = document.activeElement;
+      if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.id !== 'sync-token') return true;
+      if (document.querySelector('.lightbox.open, .cardbox.open')) return true;
+      const sec = document.querySelector('.section.active');
+      if (sec && sec.id === 'section-new') {
+        if (editingId || currentScreenshots.length) return true;
+        if ([...sec.querySelectorAll('input[type=text], input[type=number], textarea')].some(x => x.value.trim())) return true;
+      }
+      return false;
+    }
+    function refreshUI() {
+      if (!busy()) return reloadInto();
+      pending = true;
+      showToast('Synced from your other device — it shows when you leave this screen');
+    }
+
+    // ---- status UI ----
+    function ago(ts) {
+      const m = Math.round((Date.now() - ts) / 60000);
+      return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago';
+    }
+    function setStatus(st) {
+      state = st;
+      const dot = document.getElementById('sync-dot');
+      if (dot) { dot.hidden = st === 'off'; dot.dataset.state = st; dot.title = statusText(); }
+      const el = document.getElementById('sync-status');
+      if (el) { el.textContent = statusText(); el.classList.toggle('bad', st === 'error' || st === 'badkey'); }
+      const setup = document.getElementById('sync-setup'), acts = document.getElementById('sync-actions');
+      if (setup) setup.hidden = !(st === 'off' || st === 'badkey');
+      if (acts) acts.hidden = st === 'off';
+    }
+    function statusText() {
+      switch (state) {
+        case 'off': return 'Not set up on this device yet.';
+        case 'syncing': return 'Syncing…';
+        case 'ok': return 'Synced ' + (S.last ? ago(S.last) : '') + ' · ' + DEVICE;
+        case 'offline': return 'Offline — syncs as soon as you are back online.';
+        case 'badkey': return 'Your sync key stopped working (it may have expired). Paste a new one below.';
+        default: return 'Could not sync: ' + lastErr + '. Retrying automatically.';
+      }
+    }
+
+    async function connect(tok) {
+      tok = (tok || '').trim();
+      if (!tok) { showToast('Paste your sync key first'); return; }
+      setStatus('syncing');
+      try {
+        await gh('', 'GET', null, tok);
+      } catch (e) {
+        lastErr = e.status === 401 ? 'that key is not valid'
+          : e.status === 404 ? 'that key cannot see the larpenator-data repo — pick it when you create the key'
+          : (e.message || 'no connection');
+        setStatus(token() ? 'error' : 'off');
+        showToast('Could not connect: ' + lastErr);
+        return;
+      }
+      setRaw(TOKEN_KEY, tok);
+      S.commit = null; dirty = true; saveState();
+      document.getElementById('sync-token').value = '';
+      showToast('Connected — syncing now');
+      run();
+    }
+
+    function wireUI() {
+      const q = (id) => document.getElementById(id);
+      q('sync-connect').addEventListener('click', () => connect(q('sync-token').value));
+      q('sync-token').addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(q('sync-token').value); });
+      q('sync-now').addEventListener('click', () => { dirty = true; run(); });
+      q('sync-disconnect').addEventListener('click', () => {
+        if (!confirm('Stop syncing on this device? Your data stays here and in the cloud.')) return;
+        ls.removeItem(TOKEN_KEY); S.commit = null; saveState(); setStatus('off');
+      });
+      q('sync-dot').addEventListener('click', () => switchTab('data'));
+      // Deferred incoming changes land the moment you move to another screen.
+      document.querySelectorAll('.nav-item[data-tab]').forEach(n => n.addEventListener('click', (e) => {
+        if (!pending) return;
+        e.stopImmediatePropagation(); reloadInto(n.dataset.tab);
+      }, true));
+    }
+
+    function fixupDom() {
+      document.querySelectorAll('img[src^="img:"]').forEach(i => { i.src = resolve(i.getAttribute('src')); });
+      document.querySelectorAll('[data-full^="img:"]').forEach(el => { el.dataset.full = resolve(el.dataset.full); });
+    }
+
+    function start() {
+      try {
+        const t = sessionStorage.getItem('lvd_tab');
+        if (t) { sessionStorage.removeItem('lvd_tab'); if (document.querySelector(`.nav-item[data-tab="${t}"]`)) switchTab(t); }
+      } catch (e) {}
+      wireUI();
+      setStatus(token() ? 'syncing' : 'off');
+      idbLoadAll().then(async () => {
+        fixupDom();
+        for (const k of KEYS) await compact(k);
+        if (token()) run();
+      });
+      setInterval(() => { if (document.visibilityState === 'visible') run(); }, 60000);
+      setInterval(() => setStatus(state), 30000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') return;
+        if (pending && !busy()) return reloadInto();
+        schedule(300);
+      });
+      window.addEventListener('online', () => schedule(300));
+    }
+
+    return { imgSrc: resolve, start, connected: () => !!token() };
+  })();
+  function imgSrc(x) { return SYNC.imgSrc(x); }
+
   const STORAGE_KEY = 'lvd_journal_entries';
   const FOCUS_KEY = 'lvd_focus_rule';
   const MILESTONE_KEY = 'lvd_milestone';
@@ -1955,8 +2450,8 @@
   // Returns the array of screenshot data-URLs for an entry, supporting both
   // the new multi-screenshot format and legacy single-screenshot entries.
   function getEntryShots(e) {
-    if (e.screenshots && e.screenshots.length) return e.screenshots;
-    if (e.screenshot) return [e.screenshot];
+    if (e.screenshots && e.screenshots.length) return e.screenshots.map(imgSrc);
+    if (e.screenshot) return [imgSrc(e.screenshot)];
     return [];
   }
 
@@ -2926,7 +3421,7 @@
     if (!achievements.length) { grid.innerHTML = `<div class="empty-state"><div class="glyph">—</div><p>No achievements pasted yet. Paste a screenshot above.</p></div>`; return; }
     grid.innerHTML = achievements.map(a => `
       <div class="achv-card">
-        <div class="achv-img-wrap"><img src="${a.image}" data-full="${a.image}"></div>
+        <div class="achv-img-wrap"><img src="${imgSrc(a.image)}" data-full="${imgSrc(a.image)}"></div>
         <div class="achv-meta">
           <span class="achv-caption">${a.caption ? escapeHtml(a.caption) : ''}</span>
           <span style="display:flex; align-items:center; gap:12px;">
@@ -3058,7 +3553,7 @@
             ${b.outcome === 'right' ? '<span class="badge win">Right</span>' : b.outcome === 'wrong' ? '<span class="badge loss">Wrong</span>' : '<span class="badge score-badge">Unscored</span>'}
           </div>
           ${b.text ? `<div class="bias-text">${escapeHtml(b.text)}</div>` : ''}
-          ${b.screenshot ? `<img class="entry-screenshot-thumb" src="${b.screenshot}" data-full="${b.screenshot}">` : ''}
+          ${b.screenshot ? `<img class="entry-screenshot-thumb" src="${imgSrc(b.screenshot)}" data-full="${imgSrc(b.screenshot)}">` : ''}
         </div>
         <div class="bias-actions">
           <button class="btn small ghost bias-score" data-id="${b.id}" data-outcome="right">Right</button>
@@ -4252,6 +4747,7 @@
 
   document.getElementById('reset-all-btn').addEventListener('click', () => {
     const confirmed = confirm(
+      (SYNC.connected() ? 'Sync is on, so this only clears THIS device. Everything comes back from the cloud on the next sync.\n\n' : '') +
       'This will permanently wipe EVERY manual entry, checklist item, goal, achievement, premarket scenario, and saved preference stored in this browser for Larpenator 3000.\n\nThis cannot be undone. Continue?'
     );
     if (!confirmed) return;
@@ -4303,6 +4799,7 @@
 
   // ---------- init ----------
   renderDashboard();
+  SYNC.start();
 })();
 </script>
 
